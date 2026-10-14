@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Feather } from '@expo/vector-icons';
+import * as Crypto from 'expo-crypto';
 import * as Haptics from 'expo-haptics';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -16,6 +17,7 @@ import {
 import { KeyboardAvoidingView as ControllerKeyboardAvoidingView } from 'react-native-keyboard-controller';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
+import { createSupabaseClient, type TaskRow } from '@/lib/supabase';
 
 type Task = {
   id: string;
@@ -27,11 +29,69 @@ type Task = {
 type Filter = 'all' | 'open' | 'done';
 
 const STORAGE_KEY = '@simple-todo-list/tasks';
+const DEVICE_ID_KEY = '@simple-todo-list/device-id';
+const MIGRATION_KEY = '@simple-todo-list/supabase-migration-complete';
 const FILTERS: { key: Filter; label: string }[] = [
   { key: 'all', label: 'All' },
   { key: 'open', label: 'To do' },
   { key: 'done', label: 'Done' },
 ];
+
+function parseTasks(saved: string | null): Task[] {
+  if (!saved) return [];
+  try {
+    const parsed: unknown = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is Task =>
+        typeof item?.id === 'string' &&
+        typeof item?.title === 'string' &&
+        typeof item?.completed === 'boolean' &&
+        typeof item?.createdAt === 'number',
+    );
+  } catch {
+    return [];
+  }
+}
+
+function taskFromRow(row: TaskRow): Task {
+  return {
+    id: row.id,
+    title: row.title,
+    completed: row.completed,
+    createdAt: Number(row.created_at),
+  };
+}
+
+function rowFromTask(task: Task, deviceId: string): TaskRow {
+  return {
+    id: task.id,
+    device_id: deviceId,
+    title: task.title,
+    completed: task.completed,
+    created_at: task.createdAt,
+  };
+}
+
+function cloudErrorMessage(error: unknown) {
+  const message =
+    typeof error === 'object' &&
+    error !== null &&
+    'message' in error &&
+    typeof error.message === 'string'
+      ? error.message.toLowerCase()
+      : '';
+
+  if (
+    message.includes('tasks') ||
+    message.includes('schema cache') ||
+    message.includes('relation')
+  ) {
+    return 'Supabase is reachable, but the tasks table may not be set up yet. Run supabase/schema.sql in the Supabase SQL Editor, then retry.';
+  }
+
+  return 'Could not sync with Supabase. Check the project URL, publishable key, and connection, then retry.';
+}
 
 function formatToday(date: Date) {
   return date.toLocaleDateString(undefined, {
@@ -48,54 +108,93 @@ export default function TodoScreen() {
   const [draft, setDraft] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [isLoading, setIsLoading] = useState(true);
-  const [storageError, setStorageError] = useState<string | null>(null);
+  const [cloudError, setCloudError] = useState<string | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [supabase, setSupabase] = useState<ReturnType<typeof createSupabaseClient> | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     let active = true;
-    AsyncStorage.getItem(STORAGE_KEY)
-      .then((saved) => {
-        if (!active) return;
-        if (saved) {
-          const parsed: unknown = JSON.parse(saved);
-          if (Array.isArray(parsed)) {
-            setTasks(
-              parsed.filter(
-                (item): item is Task =>
-                  typeof item?.id === 'string' &&
-                  typeof item?.title === 'string' &&
-                  typeof item?.completed === 'boolean' &&
-                  typeof item?.createdAt === 'number',
-              ),
-            );
-          }
+    setIsLoading(true);
+    setCloudError(null);
+
+    async function connectAndLoad() {
+      try {
+        const localTasks = parseTasks(await AsyncStorage.getItem(STORAGE_KEY));
+        if (active) setTasks(localTasks);
+
+        let storedDeviceId = await AsyncStorage.getItem(DEVICE_ID_KEY);
+        if (!storedDeviceId) {
+          storedDeviceId = Crypto.randomUUID();
+          await AsyncStorage.setItem(DEVICE_ID_KEY, storedDeviceId);
         }
-      })
-      .catch(() => {
+
+        const client = createSupabaseClient(storedDeviceId);
         if (active) {
-          setStorageError('Your saved tasks could not be opened. Try loading them again.');
+          setDeviceId(storedDeviceId);
+          setSupabase(client);
         }
-      })
-      .finally(() => {
+
+        const { data, error } = await client
+          .from('tasks')
+          .select('id, device_id, title, completed, created_at')
+          .order('created_at', { ascending: false });
+        if (error) throw error;
+
+        const remoteRows = (data ?? []) as unknown as TaskRow[];
+        const remoteTasks = remoteRows.map(taskFromRow);
+        const migrationComplete = await AsyncStorage.getItem(MIGRATION_KEY);
+        let syncedTasks = remoteTasks;
+
+        if (!migrationComplete) {
+          const remoteIds = new Set(remoteTasks.map((task) => task.id));
+          const localOnlyTasks = localTasks.filter((task) => !remoteIds.has(task.id));
+          if (localOnlyTasks.length > 0) {
+            const { error: migrationError } = await client
+              .from('tasks')
+              .upsert(
+                localOnlyTasks.map((task) => rowFromTask(task, storedDeviceId)),
+                { onConflict: 'id' },
+              );
+            if (migrationError) throw migrationError;
+          }
+          syncedTasks = [...remoteTasks, ...localOnlyTasks].sort(
+            (first, second) => second.createdAt - first.createdAt,
+          );
+          await AsyncStorage.setItem(MIGRATION_KEY, 'true');
+        }
+
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(syncedTasks));
+        if (active) {
+          setTasks(syncedTasks);
+          setCloudError(null);
+        }
+      } catch (error) {
+        if (active) setCloudError(cloudErrorMessage(error));
+      } finally {
         if (active) setIsLoading(false);
-      });
+      }
+    }
+
+    void connectAndLoad();
 
     return () => {
       active = false;
     };
-  }, []);
+  }, [loadAttempt]);
 
   useEffect(() => {
-    if (isLoading || storageError) return;
+    if (isLoading) return;
 
     const serialized = JSON.stringify(tasks);
     saveQueue.current = saveQueue.current
       .then(() => AsyncStorage.setItem(STORAGE_KEY, serialized))
-      .then(() => setStorageError(null))
       .catch(() => {
-        setStorageError('Could not save your changes. Check your device storage and try again.');
+        setCloudError('Could not save the on-device copy of your tasks.');
       });
-  }, [isLoading, storageError, tasks]);
+  }, [isLoading, tasks]);
 
   const visibleTasks = useMemo(
     () =>
@@ -111,63 +210,82 @@ export default function TodoScreen() {
   const todayLabel = useMemo(() => formatToday(new Date()), []);
   const webInsets = Platform.OS === 'web' ? { paddingTop: 67, paddingBottom: 34 } : null;
 
-  function addTask() {
+  async function addTask() {
     const title = draft.trim();
-    if (!title || isLoading) return;
+    if (!title || !supabase || !deviceId || isLoading || cloudError || isSyncing) return;
 
     const task: Task = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      id: Crypto.randomUUID(),
       title,
       completed: false,
       createdAt: Date.now(),
     };
-    setTasks((current) => [task, ...current]);
-    setDraft('');
-    Keyboard.dismiss();
-    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setIsSyncing(true);
+    try {
+      const { error } = await supabase.from('tasks').upsert(rowFromTask(task, deviceId));
+      if (error) throw error;
+      setTasks((current) => [task, ...current]);
+      setDraft('');
+      Keyboard.dismiss();
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    } catch (error) {
+      setCloudError(cloudErrorMessage(error));
+    } finally {
+      setIsSyncing(false);
+    }
   }
 
-  function toggleTask(id: string) {
-    setTasks((current) =>
-      current.map((task) =>
-        task.id === id ? { ...task, completed: !task.completed } : task,
-      ),
-    );
-    void Haptics.selectionAsync();
+  async function toggleTask(id: string) {
+    const task = tasks.find((item) => item.id === id);
+    if (!task || !supabase || !deviceId || cloudError || isSyncing) return;
+
+    setIsSyncing(true);
+    try {
+      const { error } = await supabase
+        .from('tasks')
+        .update({ completed: !task.completed })
+        .eq('id', id)
+        .eq('device_id', deviceId);
+      if (error) throw error;
+      setTasks((current) =>
+        current.map((item) =>
+          item.id === id ? { ...item, completed: !task.completed } : item,
+        ),
+      );
+      void Haptics.selectionAsync();
+    } catch (error) {
+      setCloudError(cloudErrorMessage(error));
+    } finally {
+      setIsSyncing(false);
+    }
   }
 
-  function deleteTask(id: string) {
-    setTasks((current) => current.filter((task) => task.id !== id));
-    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  async function deleteTask(id: string) {
+    if (!supabase || !deviceId || cloudError || isSyncing) return;
+
+    setIsSyncing(true);
+    try {
+      const { error } = await supabase
+        .from('tasks')
+        .delete()
+        .eq('id', id)
+        .eq('device_id', deviceId);
+      if (error) throw error;
+      setTasks((current) => current.filter((task) => task.id !== id));
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    } catch (error) {
+      setCloudError(cloudErrorMessage(error));
+    } finally {
+      setIsSyncing(false);
+    }
   }
 
   function retryStorage() {
-    setIsLoading(true);
-    setStorageError(null);
-    AsyncStorage.getItem(STORAGE_KEY)
-      .then((saved) => {
-        if (saved) {
-          const parsed: unknown = JSON.parse(saved);
-          if (Array.isArray(parsed)) {
-            setTasks(
-              parsed.filter(
-                (item): item is Task =>
-                  typeof item?.id === 'string' &&
-                  typeof item?.title === 'string' &&
-                  typeof item?.completed === 'boolean' &&
-                  typeof item?.createdAt === 'number',
-              ),
-            );
-          }
-        }
-        setIsLoading(false);
-      })
-      .catch(() => {
-        setStorageError('Your saved tasks could not be opened. Try loading them again.');
-        setIsLoading(false);
-      });
+    setLoadAttempt((attempt) => attempt + 1);
   }
 
+  const canChangeTasks =
+    !isLoading && !cloudError && !isSyncing && !!supabase && !!deviceId;
   const styles = createStyles(colors);
 
   return (
@@ -225,7 +343,7 @@ export default function TodoScreen() {
               <TextInput
                 accessibilityLabel="New task"
                 autoCorrect
-                editable={!isLoading}
+                editable={canChangeTasks}
                 onChangeText={setDraft}
                 onSubmitEditing={addTask}
                 placeholder="What needs doing?"
@@ -238,11 +356,11 @@ export default function TodoScreen() {
               <Pressable
                 accessibilityLabel="Add task"
                 accessibilityRole="button"
-                disabled={!draft.trim() || isLoading}
+                disabled={!draft.trim() || !canChangeTasks}
                 onPress={addTask}
                 style={({ pressed }) => [
                   styles.addButton,
-                  (!draft.trim() || isLoading) && styles.addButtonDisabled,
+                  (!draft.trim() || !canChangeTasks) && styles.addButtonDisabled,
                   pressed && draft.trim() ? styles.pressed : null,
                 ]}
                 testID="add-task-button"
@@ -251,16 +369,16 @@ export default function TodoScreen() {
               </Pressable>
             </View>
 
-            {storageError ? (
+            {cloudError ? (
               <View style={styles.errorBox} accessibilityRole="alert">
-                <Text style={styles.errorText}>{storageError}</Text>
+                <Text style={styles.errorText}>{cloudError}</Text>
                 <Pressable
                   accessibilityRole="button"
                   onPress={retryStorage}
                   style={styles.retryButton}
                   testID="retry-storage-button"
                 >
-                  <Text style={styles.retryText}>Try again</Text>
+                  <Text style={styles.retryText}>Retry sync</Text>
                 </Pressable>
               </View>
             ) : null}
@@ -338,6 +456,7 @@ export default function TodoScreen() {
                       }
                       accessibilityRole="checkbox"
                       accessibilityState={{ checked: task.completed }}
+                      disabled={!canChangeTasks}
                       onPress={() => toggleTask(task.id)}
                       style={({ pressed }) => [
                         styles.checkButton,
@@ -353,6 +472,7 @@ export default function TodoScreen() {
                     <Pressable
                       accessibilityRole="button"
                       accessibilityLabel={`Toggle completion for ${task.title}`}
+                      disabled={!canChangeTasks}
                       onPress={() => toggleTask(task.id)}
                       style={styles.taskTextButton}
                     >
@@ -366,6 +486,7 @@ export default function TodoScreen() {
                     <Pressable
                       accessibilityLabel={`Delete ${task.title}`}
                       accessibilityRole="button"
+                      disabled={!canChangeTasks}
                       hitSlop={10}
                       onPress={() => deleteTask(task.id)}
                       style={({ pressed }) => [
@@ -382,7 +503,13 @@ export default function TodoScreen() {
             )}
 
             <Text style={[styles.footer, { paddingBottom: Math.max(insets.bottom, 18) }]}>
-              Saved on this device
+              {isLoading
+                ? 'Connecting to Supabase…'
+                : cloudError
+                  ? 'Showing the saved device copy'
+                  : isSyncing
+                    ? 'Syncing with Supabase…'
+                    : 'Synced with Supabase'}
             </Text>
           </ScrollView>
       </ControllerKeyboardAvoidingView>

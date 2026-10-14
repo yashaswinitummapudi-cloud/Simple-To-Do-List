@@ -1,1 +1,2 @@
 - [Expo preview warnings](expo-preview-warnings.md) — a missing DevTools system library can be non-blocking when Metro and the app preview work.
+- [Supabase task ownership](supabase-task-ownership.md) — task rows are scoped to one installation until the app has a real sign-in flow.
